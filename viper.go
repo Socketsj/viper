@@ -32,6 +32,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -203,7 +204,7 @@ type Viper struct {
 	config         map[string]interface{}
 	override       map[string]interface{}
 	defaults       map[string]interface{}
-	kvstore        map[string]interface{}
+	kvatomic       atomic.Value
 	pflags         map[string]FlagValue
 	env            map[string]string
 	aliases        map[string]string
@@ -226,7 +227,7 @@ func New() *Viper {
 	v.config = make(map[string]interface{})
 	v.override = make(map[string]interface{})
 	v.defaults = make(map[string]interface{})
-	v.kvstore = make(map[string]interface{})
+	v.kvatomic.Store(make(map[string]interface{}))
 	v.pflags = make(map[string]FlagValue)
 	v.env = make(map[string]string)
 	v.aliases = make(map[string]string)
@@ -295,6 +296,7 @@ type defaultRemoteProvider struct {
 	endpoint      string
 	path          string
 	secretKeyring string
+	hashKey       atomic.Value
 }
 
 func (rp defaultRemoteProvider) Provider() string {
@@ -313,6 +315,18 @@ func (rp defaultRemoteProvider) SecretKeyring() string {
 	return rp.secretKeyring
 }
 
+func (rp *defaultRemoteProvider) HashKey() string {
+	k, ok := rp.hashKey.Load().(string)
+	if !ok {
+		return ""
+	}
+	return k
+}
+
+func (rp *defaultRemoteProvider) SetHashKey(key string)  {
+	rp.hashKey.Store(key)
+}
+
 // RemoteProvider stores the configuration necessary
 // to connect to a remote key/value store.
 // Optional secretKeyring to unencrypt encrypted values
@@ -322,6 +336,8 @@ type RemoteProvider interface {
 	Endpoint() string
 	Path() string
 	SecretKeyring() string
+	HashKey() string
+	SetHashKey(key string)
 }
 
 // SupportedExts are universally supported extensions.
@@ -1122,11 +1138,12 @@ func (v *Viper) find(lcaseKey string, flagDefault bool) interface{} {
 	}
 
 	// K/V store next
-	val = v.searchMap(v.kvstore, path)
+	kvstore := v.kvatomic.Load().(map[string]interface{})
+	val = v.searchMap(kvstore, path)
 	if val != nil {
 		return val
 	}
-	if nested && v.isPathShadowedInDeepMap(path, v.kvstore) != "" {
+	if nested && v.isPathShadowedInDeepMap(path, kvstore) != "" {
 		return nil
 	}
 
@@ -1221,10 +1238,12 @@ func (v *Viper) registerAlias(alias string, key string) {
 				delete(v.config, alias)
 				v.config[key] = val
 			}
-			if val, ok := v.kvstore[alias]; ok {
-				delete(v.kvstore, alias)
-				v.kvstore[key] = val
+			kvstore := v.getCopyKvStore()
+			if val, ok := kvstore[alias]; ok {
+				delete(kvstore, alias)
+				kvstore[key] = val
 			}
+			v.kvatomic.Store(kvstore)
 			if val, ok := v.defaults[alias]; ok {
 				delete(v.defaults, alias)
 				v.defaults[key] = val
@@ -1747,23 +1766,27 @@ func (v *Viper) getKeyValueConfig() error {
 	}
 
 	for _, rp := range v.remoteProviders {
-		val, err := v.getRemoteConfig(rp)
+		err := v.getRemoteConfig(rp)
 		if err != nil {
 			continue
 		}
-		v.kvstore = val
 		return nil
 	}
 	return RemoteConfigError("No Files Found")
 }
 
-func (v *Viper) getRemoteConfig(provider RemoteProvider) (map[string]interface{}, error) {
+func (v *Viper) getRemoteConfig(provider RemoteProvider) error {
 	reader, err := RemoteConfig.Get(provider)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	err = v.unmarshalReader(reader, v.kvstore)
-	return v.kvstore, err
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(reader)
+	kvstore := make(map[string]interface{})
+	err = v.unmarshalReader(buf, kvstore)
+	v.kvatomic.Store(kvstore)
+	provider.SetHashKey(buf.String())
+	return nil
 }
 
 // Retrieve the first found remote configuration.
@@ -1771,13 +1794,19 @@ func (v *Viper) watchKeyValueConfigOnChannel() error {
 	for _, rp := range v.remoteProviders {
 		respc, _ := RemoteConfig.WatchChannel(rp)
 		// Todo: Add quit channel
-		go func(rc <-chan *RemoteResponse) {
+		go func(rc <-chan *RemoteResponse, rp *defaultRemoteProvider) {
 			for {
 				b := <-rc
-				reader := bytes.NewReader(b.Value)
-				v.unmarshalReader(reader, v.kvstore)
+				hashKey := string(b.Value)
+				if hashKey != rp.HashKey() {
+					reader := bytes.NewReader(b.Value)
+					kvstore := v.getCopyKvStore()
+					v.unmarshalReader(reader, kvstore)
+					v.kvatomic.Store(kvstore)
+					rp.SetHashKey(hashKey)
+				}
 			}
-		}(respc)
+		}(respc, rp)
 		return nil
 	}
 	return RemoteConfigError("No Files Found")
@@ -1785,24 +1814,38 @@ func (v *Viper) watchKeyValueConfigOnChannel() error {
 
 // Retrieve the first found remote configuration.
 func (v *Viper) watchKeyValueConfig() error {
+	c := make(map[string]interface{})
 	for _, rp := range v.remoteProviders {
-		val, err := v.watchRemoteConfig(rp)
+		err := v.watchRemoteConfig(rp, c)
 		if err != nil {
 			continue
 		}
-		v.kvstore = val
+		if len(c) > 0 {
+			// should over writer?
+			kvstore := v.getCopyKvStore()
+			for k, v := range c {
+				kvstore[k] = v
+			}
+			v.kvatomic.Store(kvstore)
+		}
 		return nil
 	}
 	return RemoteConfigError("No Files Found")
 }
 
-func (v *Viper) watchRemoteConfig(provider RemoteProvider) (map[string]interface{}, error) {
+func (v *Viper) watchRemoteConfig(provider RemoteProvider, kvStore map[string]interface{}) error {
 	reader, err := RemoteConfig.Watch(provider)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	err = v.unmarshalReader(reader, v.kvstore)
-	return v.kvstore, err
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(reader)
+	hashKey := buf.String()
+	if hashKey != provider.HashKey() {
+		err = v.unmarshalReader(buf, kvStore)
+		provider.SetHashKey(hashKey)
+	}
+	return err
 }
 
 // AllKeys returns all keys holding a value, regardless of where they are set.
@@ -1816,7 +1859,8 @@ func (v *Viper) AllKeys() []string {
 	m = v.mergeFlatMap(m, castMapFlagToMapInterface(v.pflags))
 	m = v.mergeFlatMap(m, castMapStringToMapInterface(v.env))
 	m = v.flattenAndMergeMap(m, v.config, "")
-	m = v.flattenAndMergeMap(m, v.kvstore, "")
+	kvstroe := v.kvatomic.Load().(map[string]interface{})
+	m = v.flattenAndMergeMap(m, kvstroe, "")
 	m = v.flattenAndMergeMap(m, v.defaults, "")
 
 	// convert set of paths to list
@@ -2005,11 +2049,18 @@ func (v *Viper) findConfigFile() (string, error) {
 // purposes.
 func Debug() { v.Debug() }
 func (v *Viper) Debug() {
+	kvstore := v.kvatomic.Load().(map[string]interface{})
 	fmt.Printf("Aliases:\n%#v\n", v.aliases)
 	fmt.Printf("Override:\n%#v\n", v.override)
 	fmt.Printf("PFlags:\n%#v\n", v.pflags)
 	fmt.Printf("Env:\n%#v\n", v.env)
-	fmt.Printf("Key/Value Store:\n%#v\n", v.kvstore)
+	fmt.Printf("Key/Value Store:\n%#v\n", kvstore)
 	fmt.Printf("Config:\n%#v\n", v.config)
 	fmt.Printf("Defaults:\n%#v\n", v.defaults)
+}
+
+// getCopyKvStore get on copy viper.kvstore
+func (v *Viper) getCopyKvStore() map[string]interface{} {
+	val := v.kvatomic.Load().(map[string]interface{})
+	return deepCopy(val)
 }

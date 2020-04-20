@@ -219,3 +219,27 @@ func deepSearch(m map[string]interface{}, path []string) map[string]interface{} 
 	}
 	return m
 }
+
+// deepCopy copy deps map
+func deepCopy(c map[string]interface{}) map[string]interface{} {
+	ret := make(map[string]interface{})
+	for key, val := range c {
+		switch val.(type) {
+		case map[interface{}]interface{}:
+			// nested map: cast and recursively deepCopy
+			val = cast.ToStringMap(val)
+			val = deepCopy(val.(map[string]interface{}))
+		case map[string]interface{}:
+			// nested map: recursively deepCopy
+			val = deepCopy(val.(map[string]interface{}))
+		}
+		ret[key] = val
+	}
+	return ret
+}
+
+func writeMap(dst map[string]interface{}, src map[string]interface{})  {
+	for k, v := range src {
+		dst[k] = v
+	}
+}

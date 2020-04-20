@@ -165,7 +165,9 @@ func initConfigs() {
 
 	SetConfigType("json")
 	remote := bytes.NewReader(remoteExample)
-	unmarshalReader(remote, v.kvstore)
+	kvstore := v.getCopyKvStore()
+	unmarshalReader(remote, kvstore)
+	v.kvatomic.Store(kvstore)
 
 	SetConfigType("ini")
 	r = bytes.NewReader(iniExample)
@@ -473,7 +475,9 @@ func TestRemotePrecedence(t *testing.T) {
 
 	remote := bytes.NewReader(remoteExample)
 	assert.Equal(t, "0001", Get("id"))
-	unmarshalReader(remote, v.kvstore)
+	kvstore := v.getCopyKvStore()
+	unmarshalReader(remote, kvstore)
+	v.kvatomic.Store(kvstore)
 	assert.Equal(t, "0001", Get("id"))
 	assert.NotEqual(t, "cronut", Get("type"))
 	assert.Equal(t, "remote", Get("newkey"))
